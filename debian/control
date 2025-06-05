@@ -1,0 +1,14 @@
+Source: arpsweep
+Section: utils
+Priority: optional
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Maintainer: Mikko Tanner <mikko.tanner@gmail.com>
+
+Package: arpsweep
+Architecture: all
+Depends: python3, python3-scapy
+Homepage: https://github.com/Ukko-Ylijumala/arpsweep-py
+Description: ARP sweep a subnet
+ A Python script for ARP "pinging" of a subnet.
+ Similar to arping, but for multiple hosts.
