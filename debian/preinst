@@ -1,0 +1,25 @@
+#!/bin/bash
+# Script executed before installation
+# Can be called with: install, upgrade
+
+NAME=arpsweep
+
+function check_command() {
+    if ! command -v "$1" &> /dev/null; then
+        echo "Error: command $1 is not available."
+        exit 1
+    fi
+}
+
+check_command python3
+
+case "$1" in
+    install)
+        echo "Starting installation of $NAME..."
+        ;;
+
+    upgrade)
+        ;;
+esac
+
+exit 0

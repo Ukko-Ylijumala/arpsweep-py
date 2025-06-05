@@ -1,0 +1,20 @@
+#!/bin/bash
+# Script executed after installation
+# Can be called with: configure
+
+NAME=arpsweep
+CMD=/usr/sbin/arpsweep.py
+
+function ensure_sane_state() {
+    # Make the script executable, but make sure users can't read the code
+    chown root:adm $CMD
+    chmod 750 $CMD
+}
+
+case "$1" in
+    configure)
+        ensure_sane_state
+        ;;
+esac
+
+exit 0

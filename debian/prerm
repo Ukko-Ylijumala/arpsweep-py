@@ -1,0 +1,16 @@
+#!/bin/bash
+# Script executed before removal
+# Can be called with: upgrade, remove
+
+NAME=arpsweep
+
+case "$1" in
+    remove|purge)
+        ;;
+
+    upgrade)
+        echo "Upgrading $NAME from version $2"
+        ;;
+esac
+
+exit 0

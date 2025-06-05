@@ -1,0 +1,18 @@
+#!/bin/bash
+# Script executed after removal
+# Can be called with: upgrade, remove, purge
+
+NAME=arpsweep
+
+case "$1" in
+    purge)
+        ;;
+
+    remove)
+        ;;
+
+    upgrade)
+        ;;
+esac
+
+exit 0
