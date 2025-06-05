@@ -1,0 +1,6 @@
+dist/
+debian/.debhelper/
+debian/files
+debian/debhelper-build-stamp
+debian/arpsweep/
+debian/arpsweep.substvars
