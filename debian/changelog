@@ -1,3 +1,10 @@
+arpsweep (0.3.0-1) unstable; urgency=low
+
+    * Parallel scanning with asyncio tasks implemented.
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Fri, 6 Jun 2025 16:00:00 +0300
+
+
 arpsweep (0.2.0-1) unstable; urgency=low
 
     * Initial release of the packaged version.

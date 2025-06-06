@@ -9,47 +9,56 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.0-1_20250605"
+__version__   = "0.3.0-1_20250606"
 __license__   = "GPL-3.0-or-later"
 
+import asyncio
 import json
 import os
-#import subprocess
 import sys
 from argparse import ArgumentParser
-from ipaddress import (IPv4Address, IPv4Network)
-from typing import Any, Dict, Iterable, List, Set
+from concurrent.futures import ThreadPoolExecutor
+from ipaddress import IPv4Address, IPv4Network
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from scapy.all import srp
 from scapy.layers.l2 import ARP, Ether
 
 # Are we running in a terminal?
 HAVE_TTY = sys.stdout.isatty()
+# Ethernet broadcast address
+ETHER_BC = Ether(dst="ff:ff:ff:ff:ff:ff")
 
 
 def parse_cmdline_args():
     """Parse command-line arguments."""
 
     args = ArgumentParser(description='ARP sweep of a subnet')
-    args.add_argument('cidr', help='CIDR network address to scan')
-    args.add_argument('--iface', '-I', help='Interface to use (default: autoselect)')
-    args.add_argument('--src', '-S', help='Source IP to use (default: autoselect)')
-    args.add_argument('--count', type=int, default=1, help='Number of ARP reqs (default: 1)')
-    args.add_argument('--timeout', type=int, default=1,
-                      help='ARP timeout in seconds (default: 1)')
+    args.add_argument('net', help='IPv4 network (CIDR) to scan')
+    args.add_argument('--iface', '-I', help='Interface to use (def: autoselect)')
+    args.add_argument('--src', '-S', help='Source IP to use (def: autoselect)')
+    args.add_argument('--count', type=int, default=1, help='Number of ARP reqs (def: 1)')
+    args.add_argument('--timeout', type=float, default=0.1, help='Req timeout in secs (def: 0.1)')
+    args.add_argument('--tasks', '-T', type=int, default=16, help='Scan parallelism (def: 16)')
     args.add_argument('--rand', action='store_true', help='Sweep hosts in random order')
-    args.add_argument('--batch', '-B', action='store_true', help='Batch mode - no output')
+    args.add_argument('--backgnd', '-B', action='store_true', help='Background mode, no output')
     args.add_argument('--json', action='store_true', help='JSON output')
     args.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     args.add_argument('--debug', action='store_true', help='Debug mode - extra verbose')
     args.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     p = args.parse_args()
 
-    p.cidr = IPv4Network(p.cidr)
-    p.src  = IPv4Address(p.src) if p.src else None
+    p.net = IPv4Network(p.net)
+    p.src = IPv4Address(p.src) if p.src else None
 
-    # we don't wait for answers in batch mode, nor do we want to output anything
-    if p.batch:
+    # be sensible with the number of parallel tasks
+    if p.tasks < 1:
+        p.tasks = 1
+    elif p.tasks > 1:
+        p.tasks = min(p.tasks, p.net.num_addresses)
+
+    # we don't wait for answers in background mode, nor do we want to output anything
+    if p.backgnd:
         p.count = 1
         p.timeout = 0
         p.verbose = p.debug = p.json = False
@@ -60,9 +69,78 @@ def parse_cmdline_args():
     return p
 
 
+class AsyncARPScanner:
+    def __init__(self, args, hosts: Iterable[IPv4Address], callback: Optional[Callable] = None):
+        self.exec = ThreadPoolExecutor(thread_name_prefix='arp-sweep')
+        self.limiter = asyncio.Semaphore(args.tasks)
+        self.timeout = float(args.timeout)
+        self.iface: Optional[str] = args.iface
+        self.src: Optional[IPv4Address] = args.src
+        self.hosts = hosts
+        self.count: int = args.count
+        self.debug: bool = args.debug
+        self.verbose: bool = args.verbose
+        self.callback = callback
+        # needs no locking, since we are in a single-threaded event loop
+        self.responses: Dict[str, Optional[List[Dict]]] = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exec.shutdown(wait=True)
+
+    async def _send_arp_async(self, host: IPv4Address):
+        """Send ARP request asynchronously using thread pool."""
+        try:
+            loop = asyncio.get_running_loop()
+            pkts = create_arp_packets(host, num=self.count, src=self.src)
+            args = (pkts, self.timeout, self.iface, self.verbose)
+            async with self.limiter:
+                # return the host too, so we can easily track who this task is for
+                return await loop.run_in_executor(self.exec, send_packets, *args), host
+        except Exception as e:  # pylint: disable=broad-except
+            if self.debug:
+                eprint(f"ERROR: Failed to scan {host}: {e}")
+            return None, host
+
+    async def scan_subnet(self):
+        """Scan entire subnet asynchronously."""
+        tasks = []
+        for host in self.hosts:
+            tasks.append(self._send_arp_async(host))
+
+        # Gather results
+        for i, task in enumerate(asyncio.as_completed(tasks)):
+            result, host = await task
+            if result:
+                self.responses[host] = result
+            else:
+                self.responses[host] = None
+
+            if self.debug:
+                debug_response(host, num=self.count, resp=result)
+
+            # Optional: progress callback
+            if self.callback:
+                self.callback(host, i + 1, len(self.hosts))
+
+        return self.responses
+
+
 def eprint(*values, **kwargs):
     """Mimic print() but write to stderr."""
     print(*values, file=sys.stderr, **kwargs)
+
+
+def debug_response(host: IPv4Address, num: int, resp: Optional[List[Dict]]):
+    """Print debug information about each host."""
+    if resp:
+        srcip = resp[0]['dst_ip']
+        eprint(f'DEBUG: sent {num} ARP packets to {host} (src: {srcip}),',
+                       f'received {len(resp)} responses')
+    else:
+        eprint(f'DEBUG: no responses received for {host}')
 
 
 def simple_tabulate(data: Iterable[Iterable], headers: List = None, missing = '-'):
@@ -141,40 +219,35 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
             'dst_hw': resp.hwdst,
             'type': resp.type,
             'len': len(resp),
+            'time': resp.time - sent.sent_time
         })
 
     if verbose and responses:
         r = responses[0]
-        eprint(f"{r['src_ip']} is-at {r['src_hw']} (resp: type={r['type']}, len={r['len']})")
+        eprint(f"{r['src_ip']} is-at {r['src_hw']} (resp type={r['type']}, len={r['len']})")
 
     return responses
 
 
-def create_arp_packets(bc, host: IPv4Address, num: int, src: IPv4Address | None):
+def create_arp_packets(host: IPv4Address, num: int, src: IPv4Address | None):
     """Create ARP request packet(s) for a given host."""
-    return [bc / ARP(pdst=str(host), hwsrc=str(src) if src else None)] * num
+    return [ETHER_BC / ARP(pdst=str(host), hwsrc=str(src) if src else None) for _ in range(num)]
 
 
 def do_arp_sweep(hosts: Iterable[IPv4Address], args):
     """Perform an ARP sweep on the specified hosts."""
-    ether_bc = Ether(dst="ff:ff:ff:ff:ff:ff")
-    responses: Dict[str, List[Dict[str, Any]] | None] = {}
+    responses: Dict[str, Optional[List[Dict]]] = {}
 
     for host in hosts:
-        pkts = create_arp_packets(ether_bc, host=host, num=args.count, src=args.src)
+        pkts = create_arp_packets(host, num=args.count, src=args.src)
         resp = send_packets(pkts, timeout=args.timeout, iface=args.iface, verbose=args.verbose)
         if resp:
-            responses[str(host)] = resp
+            responses[host] = resp
         else:
-            responses[str(host)] = None
+            responses[host] = None
 
         if args.debug:
-            if resp:
-                srcip = resp[0]['dst_ip']
-                eprint(f'DEBUG: sent {len(pkts)} ARP packets to {host} (src: {srcip}),',
-                       f'received {len(resp)} responses')
-            else:
-                eprint(f'DEBUG: no responses received for {host}')
+            debug_response(host, num=len(pkts), resp=resp)
 
     return responses
 
@@ -186,25 +259,34 @@ def main():
         sys.exit(1)
 
     args = parse_cmdline_args()
-    hosts: Iterable[IPv4Address] = set(args.cidr.hosts()) if args.rand else list(args.cidr.hosts())
+    hosts: Iterable[IPv4Address] = set(args.net.hosts()) if args.rand else list(args.net.hosts())
 
     if args.verbose and HAVE_TTY:
-        eprint(f'INFO: scanning {args.cidr} (net: {args.cidr.network_address},',
-               f'bcast: {args.cidr.broadcast_address}, hosts: {len(hosts)})')
+        eprint(f'INFO: scanning {args.net} (net: {args.net.network_address},',
+               f'bcast: {args.net.broadcast_address}, hosts: {len(hosts)})')
 
-    results = do_arp_sweep(hosts=hosts, args=args)
+    if args.tasks > 1:
+        if args.debug and HAVE_TTY:
+            eprint(f'DEBUG: using {args.tasks} parallel asyncio tasks for scanning')
+        with AsyncARPScanner(args, hosts, callback=None) as scanner:
+            results = asyncio.run(scanner.scan_subnet())
+    else:
+        results = do_arp_sweep(hosts=hosts, args=args)
 
-    if args.batch:
+    if args.backgnd:
         sys.exit(0)
     elif args.json:
+        # JSON encoder doesn't like IPv4Address objects -> convert to str
+        results = {str(host): resp for host, resp in results.items()}
         print(json.dumps(results, indent=2 if HAVE_TTY else None))
     elif any(val is not None for val in results.values()):
         data = []
-        headers = ['IP Address', 'MAC Address', 'Responses']
+        headers = ['IP Address', 'MAC Address', 'Recv', 'Time (ms)']
         for host, responses in results.items():
             if responses is not None:
                 resp = responses[0]
-                data.append([host, resp['src_hw'], len(responses)])
+                data.append([host, resp['src_hw'], len(responses), f"{resp['time']*1e3:.4f}"])
+        data.sort(key=lambda x: x[0])
         print(simple_tabulate(data, headers=headers))
     else:
         eprint("INFO: no responses received.")
