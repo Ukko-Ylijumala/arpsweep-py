@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.0-1_20250606"
+__version__   = "0.3.1-1_20250606"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -19,9 +19,10 @@ import sys
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from ipaddress import IPv4Address, IPv4Network
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from time import sleep
+from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional
 
-from scapy.all import srp
+from scapy.all import sendp, srp
 from scapy.layers.l2 import ARP, Ether
 
 # Are we running in a terminal?
@@ -41,7 +42,7 @@ def parse_cmdline_args():
     args.add_argument('--timeout', type=float, default=0.1, help='Req timeout in secs (def: 0.1)')
     args.add_argument('--tasks', '-T', type=int, default=16, help='Scan parallelism (def: 16)')
     args.add_argument('--rand', action='store_true', help='Sweep hosts in random order')
-    args.add_argument('--backgnd', '-B', action='store_true', help='Background mode, no output')
+    args.add_argument('--daemon', '-D', action='store_true', help='Detach process (daemonize)')
     args.add_argument('--json', action='store_true', help='JSON output')
     args.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     args.add_argument('--debug', action='store_true', help='Debug mode - extra verbose')
@@ -56,12 +57,6 @@ def parse_cmdline_args():
         p.tasks = 1
     elif p.tasks > 1:
         p.tasks = min(p.tasks, p.net.num_addresses)
-
-    # we don't wait for answers in background mode, nor do we want to output anything
-    if p.backgnd:
-        p.count = 1
-        p.timeout = 0
-        p.verbose = p.debug = p.json = False
 
     if p.debug:
         p.verbose = True
@@ -252,6 +247,43 @@ def do_arp_sweep(hosts: Iterable[IPv4Address], args):
     return responses
 
 
+def fork_off():
+    """Fork and detach the child process from the terminal/caller."""
+    pid = os.fork()
+    if pid > 0:
+        # exit parent process with success
+        sys.exit(0)
+
+    # detach from terminal
+    os.setsid()
+
+    # redirect standard file descriptors to /dev/null
+    sys.stdin.close()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with open(os.devnull, 'rb', 0) as devnull:
+        os.dup2(devnull.fileno(), 0)
+    with open(os.devnull, 'ab', 0) as devnull:
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+
+
+def batch_send(args, packets: List[Ether]):
+    """Send ARP packets in batches without waiting for responses."""
+    for i in range(0, len(packets), args.tasks):
+        chunk = packets[i:i+args.tasks]
+        sendp(chunk, iface=args.iface, count=args.count, verbose=False, inter=0.05) # 20 pps
+        sleep(args.timeout)  # wait a bit before sending the next batch
+
+
+def daemonize(args, hosts: Iterable[IPv4Address]) -> NoReturn:
+    """Daemonize the process to run in the background."""
+    pkts = [pkt for h in hosts for pkt in create_arp_packets(h, num=1, src=args.src)]
+    fork_off()
+    batch_send(args, packets=pkts)
+    sys.exit(0)
+
+
 def main():
     """Main function to run the ARP sweep process"""
     if os.geteuid() != 0:
@@ -260,6 +292,9 @@ def main():
 
     args = parse_cmdline_args()
     hosts: Iterable[IPv4Address] = set(args.net.hosts()) if args.rand else list(args.net.hosts())
+
+    if args.daemon:
+        daemonize(args, hosts=hosts)
 
     if args.verbose and HAVE_TTY:
         eprint(f'INFO: scanning {args.net} (net: {args.net.network_address},',
@@ -273,9 +308,7 @@ def main():
     else:
         results = do_arp_sweep(hosts=hosts, args=args)
 
-    if args.backgnd:
-        sys.exit(0)
-    elif args.json:
+    if args.json:
         # JSON encoder doesn't like IPv4Address objects -> convert to str
         results = {str(host): resp for host, resp in results.items()}
         print(json.dumps(results, indent=2 if HAVE_TTY else None))

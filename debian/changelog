@@ -1,3 +1,10 @@
+arpsweep (0.3.1-1) unstable; urgency=low
+
+    * Daemon mode forks off from TTY or caller.
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Fri, 6 Jun 2025 19:40:00 +0300
+
+
 arpsweep (0.3.0-1) unstable; urgency=low
 
     * Parallel scanning with asyncio tasks implemented.
