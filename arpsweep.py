@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.1-1_20250606"
+__version__   = "0.3.2-1_20250611"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -25,10 +25,57 @@ from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional
 from scapy.all import sendp, srp
 from scapy.layers.l2 import ARP, Ether
 
+try:
+    from socket import AF_INET
+    from pyroute2 import IPRoute
+    IPR = IPRoute()
+except ImportError:
+    IPR = None
+
 # Are we running in a terminal?
 HAVE_TTY = sys.stdout.isatty()
 # Ethernet broadcast address
 ETHER_BC = Ether(dst="ff:ff:ff:ff:ff:ff")
+# ARP cache path
+ARP_CACHE = '/proc/net/arp'
+
+
+class Neighbor:
+    """Class to represent a neighbor in the ARP cache."""
+    def __init__(self, ip: IPv4Address, hw: str, iface: Optional[str] = None,
+                 verbose = False, cached = False):
+        self.ip = ip
+        self.hw = hw
+        self.iface = iface
+        self.if_ip: Optional[IPv4Address] = None
+        self.if_hw: Optional[str] = None
+        self.ttl: Optional[int] = None  # time to live (if available)
+        self.responses: List[Dict] = []
+        self.cached = cached
+        if verbose:
+            eprint(f'{self}')
+
+    def __repr__(self):
+        return f"Neighbor(ip='{self.ip}', mac='{self.hw}', iface='{self.iface}')"
+
+    def __str__(self):
+        s = f'{self.ip} is-at {self.hw}'
+        if self.iface:
+            s += f' on {self.iface}'
+        if self.cached:
+            s += ' (cached)'
+        return s
+
+    def __len__(self):
+        """Number of ARP responses received."""
+        return len(self.responses)
+
+    @property
+    def time(self):
+        """Return the average time of responses."""
+        if self.responses:
+            return sum(resp['time'] for resp in self.responses) / len(self.responses)
+        return 0.0
 
 
 def parse_cmdline_args():
@@ -43,6 +90,8 @@ def parse_cmdline_args():
     args.add_argument('--tasks', '-T', type=int, default=16, help='Scan parallelism (def: 16)')
     args.add_argument('--rand', action='store_true', help='Sweep hosts in random order')
     args.add_argument('--daemon', '-D', action='store_true', help='Detach process (daemonize)')
+    args.add_argument('--neigh', '-N', action='store_true',
+                      help='Utilize information in ARP/neighbor cache')
     args.add_argument('--json', action='store_true', help='JSON output')
     args.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     args.add_argument('--debug', action='store_true', help='Debug mode - extra verbose')
@@ -61,6 +110,9 @@ def parse_cmdline_args():
     if p.debug:
         p.verbose = True
 
+    if p.neigh and IPR is None and p.debug:
+        eprint("WARN: --neigh requires 'python3-pyroute2[-minimal]' for some features.")
+
     return p
 
 
@@ -77,7 +129,7 @@ class AsyncARPScanner:
         self.verbose: bool = args.verbose
         self.callback = callback
         # needs no locking, since we are in a single-threaded event loop
-        self.responses: Dict[str, Optional[List[Dict]]] = {}
+        self.responses: Dict[IPv4Address, Optional[Neighbor]] = {}
 
     def __enter__(self):
         return self
@@ -85,7 +137,7 @@ class AsyncARPScanner:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.exec.shutdown(wait=True)
 
-    async def _send_arp_async(self, host: IPv4Address):
+    async def _send_arp_async(self, host: IPv4Address) -> tuple[Optional[Neighbor], IPv4Address]:
         """Send ARP request asynchronously using thread pool."""
         try:
             loop = asyncio.get_running_loop()
@@ -114,7 +166,7 @@ class AsyncARPScanner:
                 self.responses[host] = None
 
             if self.debug:
-                debug_response(host, num=self.count, resp=result)
+                debug_response(host, num=self.count, neigh=result)
 
             # Optional: progress callback
             if self.callback:
@@ -128,12 +180,12 @@ def eprint(*values, **kwargs):
     print(*values, file=sys.stderr, **kwargs)
 
 
-def debug_response(host: IPv4Address, num: int, resp: Optional[List[Dict]]):
-    """Print debug information about each host."""
-    if resp:
-        srcip = resp[0]['dst_ip']
+def debug_response(host: IPv4Address, num: int, neigh: Optional[Neighbor]):
+    """Print debug information about each neighbor."""
+    if neigh:
+        srcip = neigh.if_ip if neigh.if_ip else 'unknown'
         eprint(f'DEBUG: sent {num} ARP packets to {host} (src: {srcip}),',
-                       f'received {len(resp)} responses')
+               f'received {len(neigh)} responses')
     else:
         eprint(f'DEBUG: no responses received for {host}')
 
@@ -201,7 +253,7 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
         verbose: Whether to print each response to stderr
 
     Returns:
-        List of dictionaries containing the received packets' information
+        Neighbor object with responses, or None if no responses received.
     """
     responses: List[Dict[str, Any]] = []
     ans, unans = srp(pkts, timeout=timeout, iface=iface, verbose=False)
@@ -210,18 +262,20 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
             # since these are responses, the 'src' and 'dst' are reversed
             'src_ip': resp.psrc,
             'src_hw': resp.hwsrc,
-            'dst_ip': resp.pdst,
-            'dst_hw': resp.hwdst,
             'type': resp.type,
             'len': len(resp),
             'time': resp.time - sent.sent_time
         })
 
-    if verbose and responses:
+    if responses:
         r = responses[0]
-        eprint(f"{r['src_ip']} is-at {r['src_hw']} (resp type={r['type']}, len={r['len']})")
+        neigh = Neighbor(ip=r['src_ip'], hw=r['src_hw'], iface=iface, verbose=verbose)
+        neigh.if_ip = IPv4Address(ans[0][1].pdst)
+        neigh.if_hw = ans[0][1].hwdst
+        neigh.responses = responses
+        return neigh
 
-    return responses
+    return None
 
 
 def create_arp_packets(host: IPv4Address, num: int, src: IPv4Address | None):
@@ -231,7 +285,7 @@ def create_arp_packets(host: IPv4Address, num: int, src: IPv4Address | None):
 
 def do_arp_sweep(hosts: Iterable[IPv4Address], args):
     """Perform an ARP sweep on the specified hosts."""
-    responses: Dict[str, Optional[List[Dict]]] = {}
+    responses: Dict[IPv4Address, Optional[Neighbor]] = {}
 
     for host in hosts:
         pkts = create_arp_packets(host, num=args.count, src=args.src)
@@ -242,7 +296,7 @@ def do_arp_sweep(hosts: Iterable[IPv4Address], args):
             responses[host] = None
 
         if args.debug:
-            debug_response(host, num=len(pkts), resp=resp)
+            debug_response(host, num=len(pkts), neigh=resp)
 
     return responses
 
@@ -284,6 +338,84 @@ def daemonize(args, hosts: Iterable[IPv4Address]) -> NoReturn:
     sys.exit(0)
 
 
+def get_arp_cache(verbose: bool, debug: bool):
+    """Get the kernel ARP cache with pyroute2 (fallback: parse /proc/net/arp)."""
+    cache: Dict[IPv4Address, Neighbor] = {}
+
+    if IPR is not None:
+        if debug:
+            eprint('DEBUG: Reading ARP cache using pyroute2')
+        for n in IPR.get_neighbours(AF_INET, match=lambda x: x['state'] == 2):
+            try:
+                # unpack attributes (list of tuples) into a dict for easier access
+                attrs = {a[0]: a[1] for a in n['attrs']}
+                ip    = IPv4Address(attrs['NDA_DST'])
+                n_hw  = attrs['NDA_LLADDR']
+                n_ttl = attrs['NDA_CACHEINFO']
+
+                # neighbour interface object
+                if_obj   = IPR.get_links(n['ifindex'])
+                if_attrs = {a[0]: a[1] for a in if_obj[0]['attrs']}
+                if_name  = if_attrs.get('IFLA_IFNAME', 'unknown')
+
+                # address object and its attributes
+                addr = IPR.get_addr(index=n['ifindex'])[0]
+                addr_attrs = {a[0]: a[1] for a in addr['attrs']}
+                if_ip = addr_attrs.get('IFA_ADDRESS', None)
+
+                # create a Neighbor object and populate it
+                neigh = Neighbor(ip, hw=n_hw, iface=if_name, verbose=verbose, cached=True)
+                neigh.if_ip = IPv4Address(if_ip) if if_ip else None
+                neigh.if_hw = if_attrs.get('IFLA_ADDRESS', 'unknown')
+                neigh.ttl = n_ttl
+                if ip not in cache:
+                    cache[ip] = neigh
+            except Exception as e:  # pylint: disable=broad-except
+                if debug:
+                    eprint(f'DEBUG: could not parse ARP cache entry: {e}')
+        return cache
+
+    # fallback to parsing /proc/net/arp
+    if debug:
+        eprint(f'DEBUG: Reading ARP cache from {ARP_CACHE}')
+    try:
+        with open(ARP_CACHE, 'r', encoding='utf-8') as f:
+            next(f) # skip header
+            for line in f:
+                # Fields: IP_addr, HW_type, Flags, HW_addr, Mask, Device
+                parts = line.split()
+                if len(parts) != 6:
+                    if debug:
+                        eprint(f"DEBUG: unexpected format in '{ARP_CACHE}': {line.strip()}")
+                    break
+                try:
+                    if parts[2] != '0x0':   # Flag 0x2 = valid entry, 0x0 = incomplete
+                        ip, hw, if_name = IPv4Address(parts[0]), parts[3], parts[5]
+                        neigh = Neighbor(ip, hw=hw, iface=if_name, verbose=debug, cached=True)
+                        if ip not in cache:
+                            cache[ip] = neigh
+                except (ValueError, IndexError):
+                    if debug:
+                        eprint(f'DEBUG: could not parse ARP cache entry: {line.strip()}')
+    except (FileNotFoundError, PermissionError):
+        if debug:
+            eprint(f"DEBUG: Could not read ARP cache: '{ARP_CACHE}'")
+    return cache
+
+
+def filter_cached(hosts: Iterable[IPv4Address], verbose: bool, debug: bool):
+    """Filter out hosts that are already in ARP cache."""
+    cached = get_arp_cache(verbose, debug)
+    filtered = [h for h in hosts if h not in cached]
+    removed  = set(hosts) - set(filtered)
+
+    if debug and removed:
+        eprint(f'DEBUG: skipping {len(removed)} hosts already in ARP cache')
+
+    # TODO: integrate (relevant) cached neighbors into the results
+    return filtered
+
+
 def main():
     """Main function to run the ARP sweep process"""
     if os.geteuid() != 0:
@@ -292,6 +424,8 @@ def main():
 
     args = parse_cmdline_args()
     hosts: Iterable[IPv4Address] = set(args.net.hosts()) if args.rand else list(args.net.hosts())
+    if args.neigh:
+        hosts = filter_cached(hosts, verbose=args.verbose, debug=args.debug)
 
     if args.daemon:
         daemonize(args, hosts=hosts)
@@ -314,11 +448,10 @@ def main():
         print(json.dumps(results, indent=2 if HAVE_TTY else None))
     elif any(val is not None for val in results.values()):
         data = []
-        headers = ['IP Address', 'MAC Address', 'Recv', 'Time (ms)']
-        for host, responses in results.items():
-            if responses is not None:
-                resp = responses[0]
-                data.append([host, resp['src_hw'], len(responses), f"{resp['time']*1e3:.4f}"])
+        headers = ['IP address', 'HW address', 'Recv', 'Time (ms)']
+        for host, neigh in results.items():
+            if neigh is not None:
+                data.append([host, neigh.hw, len(neigh), f'{neigh.time*1e3:.4f}'])
         data.sort(key=lambda x: x[0])
         print(simple_tabulate(data, headers=headers))
     else:

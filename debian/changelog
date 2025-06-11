@@ -1,3 +1,11 @@
+arpsweep (0.3.2-1) unstable; urgency=low
+
+    * Encapsulate neighbor info in a class.
+    * Add the ability to skip hosts which are present in ARP cache.
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Wed, 11 Jun 2025 23:00:00 +0300
+
+
 arpsweep (0.3.1-1) unstable; urgency=low
 
     * Daemon mode forks off from TTY or caller.
