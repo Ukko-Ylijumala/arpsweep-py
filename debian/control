@@ -8,6 +8,7 @@ Maintainer: Mikko Tanner <mikko.tanner@gmail.com>
 Package: arpsweep
 Architecture: all
 Depends: python3, python3-scapy
+Recommends: python3-pyroute2-minimal
 Homepage: https://github.com/Ukko-Ylijumala/arpsweep-py
 Description: ARP sweep a subnet
  A Python script for ARP "pinging" of a subnet.
