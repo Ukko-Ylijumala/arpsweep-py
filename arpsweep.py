@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.2-1_20250611"
+__version__   = "0.3.2-2_20250612"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -61,7 +61,7 @@ class Neighbor:
     def __str__(self):
         s = f'{self.ip} is-at {self.hw}'
         if self.iface:
-            s += f' on {self.iface}'
+            s += f' dev {self.iface}'
         if self.cached:
             s += ' (cached)'
         return s
@@ -338,44 +338,37 @@ def daemonize(args, hosts: Iterable[IPv4Address]) -> NoReturn:
     sys.exit(0)
 
 
-def get_arp_cache(verbose: bool, debug: bool):
-    """Get the kernel ARP cache with pyroute2 (fallback: parse /proc/net/arp)."""
+def get_interface(iface: str | int) -> Dict:
+    """Get interface information using pyroute2 from interface name or index."""
+    if isinstance(iface, int):
+        link = IPR.get_links(iface)
+    else:
+        link = IPR.get_links(IPR.link_lookup(ifname=iface)[0])  # pylint: disable=no-member
+
+    if not link or not isinstance(link, list) or len(link) == 0 or not isinstance(link[0], dict):
+        raise ValueError(f"interface '{iface}' not found or malformed data ({link=})")
+
+    link  = link[0]  # get the first (and only) link's data
+    attrs = {a[0]: a[1] for a in link['attrs']}
+    data  = {
+        'name': attrs['IFLA_IFNAME'],
+        'idx': link['index'],
+        'attrs': attrs,
+        'hwaddr': attrs.get('IFLA_ADDRESS', 'unknown'),
+        'ipaddr': []
+        }
+
+    # get IPv4 addresses of the iface - primary addr normally is at index 0
+    for ip in IPR.get_addr(index=data['idx'], family=AF_INET):
+        addr_attrs = {a[0]: a[1] for a in ip['attrs']}
+        data['ipaddr'].append(IPv4Address(addr_attrs['IFA_ADDRESS']))
+
+    return data
+
+
+def get_arp_cache_fromproc(debug: bool):
+    """Get the kernel ARP cache from /proc/net/arp."""
     cache: Dict[IPv4Address, Neighbor] = {}
-
-    if IPR is not None:
-        if debug:
-            eprint('DEBUG: Reading ARP cache using pyroute2')
-        for n in IPR.get_neighbours(AF_INET, match=lambda x: x['state'] == 2):
-            try:
-                # unpack attributes (list of tuples) into a dict for easier access
-                attrs = {a[0]: a[1] for a in n['attrs']}
-                ip    = IPv4Address(attrs['NDA_DST'])
-                n_hw  = attrs['NDA_LLADDR']
-                n_ttl = attrs['NDA_CACHEINFO']
-
-                # neighbour interface object
-                if_obj   = IPR.get_links(n['ifindex'])
-                if_attrs = {a[0]: a[1] for a in if_obj[0]['attrs']}
-                if_name  = if_attrs.get('IFLA_IFNAME', 'unknown')
-
-                # address object and its attributes
-                addr = IPR.get_addr(index=n['ifindex'])[0]
-                addr_attrs = {a[0]: a[1] for a in addr['attrs']}
-                if_ip = addr_attrs.get('IFA_ADDRESS', None)
-
-                # create a Neighbor object and populate it
-                neigh = Neighbor(ip, hw=n_hw, iface=if_name, verbose=verbose, cached=True)
-                neigh.if_ip = IPv4Address(if_ip) if if_ip else None
-                neigh.if_hw = if_attrs.get('IFLA_ADDRESS', 'unknown')
-                neigh.ttl = n_ttl
-                if ip not in cache:
-                    cache[ip] = neigh
-            except Exception as e:  # pylint: disable=broad-except
-                if debug:
-                    eprint(f'DEBUG: could not parse ARP cache entry: {e}')
-        return cache
-
-    # fallback to parsing /proc/net/arp
     if debug:
         eprint(f'DEBUG: Reading ARP cache from {ARP_CACHE}')
     try:
@@ -400,12 +393,62 @@ def get_arp_cache(verbose: bool, debug: bool):
     except (FileNotFoundError, PermissionError):
         if debug:
             eprint(f"DEBUG: Could not read ARP cache: '{ARP_CACHE}'")
+
     return cache
 
 
-def filter_cached(hosts: Iterable[IPv4Address], verbose: bool, debug: bool):
+def get_arp_cache(verbose: bool, debug: bool, iface: Optional[str]):
+    """Get the kernel ARP cache with pyroute2 (fallback: parse /proc/net/arp)."""
+    if IPR is None:
+        return get_arp_cache_fromproc(debug)
+    if debug:
+        eprint('DEBUG: Reading ARP cache using pyroute2')
+
+    if_data = None
+    cache: Dict[IPv4Address, Neighbor] = {}
+
+    if iface:
+        try:
+            if_data = get_interface(iface)
+            if debug:
+                eprint(f"DEBUG: using interface {if_data['name']} (idx: {if_data['idx']})")
+        except (ValueError, IndexError, KeyError) as e:
+            eprint(f'ERROR: get_interface: {e}')
+            return cache
+        nlist = IPR.get_neighbours(AF_INET, match=lambda x: x['state'] == 2, ifname=iface)
+    else:
+        nlist = IPR.get_neighbours(AF_INET, match=lambda x: x['state'] == 2)
+
+    for n in nlist:
+        try:
+            # unpack attributes (list of tuples) into a dict for easier access
+            attrs = {a[0]: a[1] for a in n['attrs']}
+            n_ip  = IPv4Address(attrs['NDA_DST'])
+            n_hw  = attrs['NDA_LLADDR']
+            n_ttl = attrs['NDA_CACHEINFO']
+
+            # neighbour interface
+            if if_data is None or if_data['idx'] != n['ifindex']:
+                if_data = get_interface(n['ifindex'])
+            if_name = iface or if_data['name']
+
+            # create a Neighbor object and populate it
+            neigh = Neighbor(n_ip, hw=n_hw, iface=if_name, verbose=verbose, cached=True)
+            neigh.if_ip = IPv4Address(if_data['ipaddr'][0]) if if_data['ipaddr'] else None
+            neigh.if_hw = if_data['hwaddr']
+            neigh.ttl = n_ttl
+            if n_ip not in cache:
+                cache[n_ip] = neigh
+        except Exception as e:  # pylint: disable=broad-except
+            if debug:
+                eprint(f'DEBUG: could not parse ARP cache entry: {e}')
+
+    return cache
+
+
+def filter_cached(hosts: Iterable[IPv4Address], verbose: bool, debug: bool, iface: Optional[str]):
     """Filter out hosts that are already in ARP cache."""
-    cached = get_arp_cache(verbose, debug)
+    cached = get_arp_cache(verbose, debug, iface=iface)
     filtered = [h for h in hosts if h not in cached]
     removed  = set(hosts) - set(filtered)
 
@@ -425,7 +468,7 @@ def main():
     args = parse_cmdline_args()
     hosts: Iterable[IPv4Address] = set(args.net.hosts()) if args.rand else list(args.net.hosts())
     if args.neigh:
-        hosts = filter_cached(hosts, verbose=args.verbose, debug=args.debug)
+        hosts = filter_cached(hosts, verbose=args.verbose, debug=args.debug, iface=args.iface)
 
     if args.daemon:
         daemonize(args, hosts=hosts)

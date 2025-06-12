@@ -1,3 +1,10 @@
+arpsweep (0.3.2-2) unstable; urgency=low
+
+    * Refactor and improve neighbor querying logic.
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Thu, 12 Jun 2025 19:00:00 +0300
+
+
 arpsweep (0.3.2-1) unstable; urgency=low
 
     * Encapsulate neighbor info in a class.
