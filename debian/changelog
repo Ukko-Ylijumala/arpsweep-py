@@ -1,3 +1,13 @@
+arpsweep (0.3.3-1) unstable; urgency=low
+
+    * get_arp_cache_fromproc() honours interface if specified.
+    * refactor get_interface() and its args. Add lru_cache on it.
+    * send_packets() does some basic response validation.
+    * move output generation to generate_output().
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Mon, 16 Jun 2025 19:00:00 +0300
+
+
 arpsweep (0.3.2-2) unstable; urgency=low
 
     * Refactor and improve neighbor querying logic.

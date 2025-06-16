@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.2-2_20250612"
+__version__   = "0.3.3-1_20250616"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -18,6 +18,7 @@ import os
 import sys
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from ipaddress import IPv4Address, IPv4Network
 from time import sleep
 from typing import Any, Callable, Dict, Iterable, List, NoReturn, Optional
@@ -56,7 +57,7 @@ class Neighbor:
             eprint(f'{self}')
 
     def __repr__(self):
-        return f"Neighbor(ip='{self.ip}', mac='{self.hw}', iface='{self.iface}')"
+        return f"Neighbor(ip='{self.ip}', hw='{self.hw}', iface='{self.iface}')"
 
     def __str__(self):
         s = f'{self.ip} is-at {self.hw}'
@@ -258,6 +259,13 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
     responses: List[Dict[str, Any]] = []
     ans, unans = srp(pkts, timeout=timeout, iface=iface, verbose=False)
     for sent, resp in ans:
+        # warn if sent and received interfaces do not match
+        if sent.hwsrc != resp.hwdst:
+            if_sent = get_interface(hwaddr=sent.hwsrc)['name']
+            if_resp = get_interface(hwaddr=resp.hwdst)['name']
+            eprint(f'WARN: sent packet from {if_sent} ({sent.hwsrc}),',
+                   f'got response on {if_resp} ({resp.hwdst})')
+
         responses.append({
             # since these are responses, the 'src' and 'dst' are reversed
             'src_ip': resp.psrc,
@@ -269,6 +277,8 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
 
     if responses:
         r = responses[0]
+        if not iface:
+            iface = get_interface(hwaddr=ans[0][1].hwdst)['name']
         neigh = Neighbor(ip=r['src_ip'], hw=r['src_hw'], iface=iface, verbose=verbose)
         neigh.if_ip = IPv4Address(ans[0][1].pdst)
         neigh.if_hw = ans[0][1].hwdst
@@ -338,15 +348,23 @@ def daemonize(args, hosts: Iterable[IPv4Address]) -> NoReturn:
     sys.exit(0)
 
 
-def get_interface(iface: str | int) -> Dict:
-    """Get interface information using pyroute2 from interface name or index."""
-    if isinstance(iface, int):
-        link = IPR.get_links(iface)
+@lru_cache
+def get_interface(idx: Optional[int] = None,
+                  name: Optional[str] = None,
+                  hwaddr: Optional[str] = None) -> Dict:
+    """Get interface information using pyroute2 from interface name, index or hwaddr."""
+    link = None
+    if idx:
+        link = IPR.get_links(idx)
+    elif name:
+        link = IPR.get_links(IPR.link_lookup(ifname=name)[0])       # pylint: disable=no-member
+    elif hwaddr:
+        link = IPR.get_links(IPR.link_lookup(address=hwaddr)[0])    # pylint: disable=no-member
     else:
-        link = IPR.get_links(IPR.link_lookup(ifname=iface)[0])  # pylint: disable=no-member
+        raise ValueError("One of 'name', 'idx' or 'hwaddr' must be provided")
 
     if not link or not isinstance(link, list) or len(link) == 0 or not isinstance(link[0], dict):
-        raise ValueError(f"interface '{iface}' not found or malformed data ({link=})")
+        raise ValueError(f"iface '{name or idx or hwaddr}' not found, or faulty data ({link=})")
 
     link  = link[0]  # get the first (and only) link's data
     attrs = {a[0]: a[1] for a in link['attrs']}
@@ -366,7 +384,7 @@ def get_interface(iface: str | int) -> Dict:
     return data
 
 
-def get_arp_cache_fromproc(debug: bool):
+def get_arp_cache_fromproc(debug: bool, iface: Optional[str] = None):
     """Get the kernel ARP cache from /proc/net/arp."""
     cache: Dict[IPv4Address, Neighbor] = {}
     if debug:
@@ -384,6 +402,8 @@ def get_arp_cache_fromproc(debug: bool):
                 try:
                     if parts[2] != '0x0':   # Flag 0x2 = valid entry, 0x0 = incomplete
                         ip, hw, if_name = IPv4Address(parts[0]), parts[3], parts[5]
+                        if iface and if_name != iface:
+                            continue  # skip if iface does not match
                         neigh = Neighbor(ip, hw=hw, iface=if_name, verbose=debug, cached=True)
                         if ip not in cache:
                             cache[ip] = neigh
@@ -400,21 +420,22 @@ def get_arp_cache_fromproc(debug: bool):
 def get_arp_cache(verbose: bool, debug: bool, iface: Optional[str]):
     """Get the kernel ARP cache with pyroute2 (fallback: parse /proc/net/arp)."""
     if IPR is None:
-        return get_arp_cache_fromproc(debug)
+        return get_arp_cache_fromproc(debug, iface=iface)
+
     if debug:
         eprint('DEBUG: Reading ARP cache using pyroute2')
-
     if_data = None
     cache: Dict[IPv4Address, Neighbor] = {}
 
     if iface:
         try:
-            if_data = get_interface(iface)
+            if_data = get_interface(name=iface)
             if debug:
                 eprint(f"DEBUG: using interface {if_data['name']} (idx: {if_data['idx']})")
         except (ValueError, IndexError, KeyError) as e:
             eprint(f'ERROR: get_interface: {e}')
             return cache
+        # state == 2 means 'reachable' (valid entry)
         nlist = IPR.get_neighbours(AF_INET, match=lambda x: x['state'] == 2, ifname=iface)
     else:
         nlist = IPR.get_neighbours(AF_INET, match=lambda x: x['state'] == 2)
@@ -429,7 +450,7 @@ def get_arp_cache(verbose: bool, debug: bool, iface: Optional[str]):
 
             # neighbour interface
             if if_data is None or if_data['idx'] != n['ifindex']:
-                if_data = get_interface(n['ifindex'])
+                if_data = get_interface(idx=n['ifindex'])
             if_name = iface or if_data['name']
 
             # create a Neighbor object and populate it
@@ -446,17 +467,45 @@ def get_arp_cache(verbose: bool, debug: bool, iface: Optional[str]):
     return cache
 
 
-def filter_cached(hosts: Iterable[IPv4Address], verbose: bool, debug: bool, iface: Optional[str]):
+def filter_cached(hosts: Iterable[IPv4Address], verb: bool, dbg: bool, iface: Optional[str]):
     """Filter out hosts that are already in ARP cache."""
-    cached = get_arp_cache(verbose, debug, iface=iface)
+    cached = get_arp_cache(verbose=verb, debug=dbg, iface=iface)
     filtered = [h for h in hosts if h not in cached]
     removed  = set(hosts) - set(filtered)
 
-    if debug and removed:
+    if dbg and removed:
         eprint(f'DEBUG: skipping {len(removed)} hosts already in ARP cache')
 
-    # TODO: integrate (relevant) cached neighbors into the results
-    return filtered
+    return filtered, cached
+
+
+def generate_output(cache: Dict, results: Dict, json_out: bool) -> Optional[str]:
+    """Generate human-readable or JSON output from the results."""
+    if json_out:
+        # JSON encoder doesn't like IPv4Address objects -> convert to str
+        return json.dumps({
+            str(host): {'hw': resp.hw, 'iface': resp.iface, 'resp': len(resp), 'time': resp.time}
+            if resp is not None else None
+            for host, resp in {**cache, **results}.items()
+            }, indent=2 if HAVE_TTY else None)
+
+    if any(val is not None for val in results.values()) or cache:
+        data = []
+        headers = ['IP address', 'HW address', 'iface', 'Recv', 'Time (ms)']
+
+        # add entries from ARP cache (if any)
+        for host, neigh in cache.items():
+            data.append([host, neigh.hw, neigh.iface, None, None])
+
+        # add entries from ARP responses (if any)
+        for host, neigh in results.items():
+            if neigh is not None:
+                data.append([host, neigh.hw, neigh.iface, len(neigh), f'{neigh.time*1e3:.4f}'])
+
+        data.sort(key=lambda x: x[0])
+        return simple_tabulate(data, headers=headers)
+
+    return None
 
 
 def main():
@@ -467,15 +516,17 @@ def main():
 
     args = parse_cmdline_args()
     hosts: Iterable[IPv4Address] = set(args.net.hosts()) if args.rand else list(args.net.hosts())
+    cache: Dict[IPv4Address, Neighbor] = {}
     if args.neigh:
-        hosts = filter_cached(hosts, verbose=args.verbose, debug=args.debug, iface=args.iface)
+        hosts, cache = filter_cached(hosts, verb=args.verbose, dbg=args.debug, iface=args.iface)
 
     if args.daemon:
         daemonize(args, hosts=hosts)
 
     if args.verbose and HAVE_TTY:
-        eprint(f'INFO: scanning {args.net} (net: {args.net.network_address},',
-               f'bcast: {args.net.broadcast_address}, hosts: {len(hosts)})')
+        net: IPv4Network = args.net
+        eprint(f'INFO: scanning {net} (net: {net.network_address},',
+               f'bcast: {net.broadcast_address}, hosts: {len(hosts)} of {net.num_addresses})')
 
     if args.tasks > 1:
         if args.debug and HAVE_TTY:
@@ -485,18 +536,9 @@ def main():
     else:
         results = do_arp_sweep(hosts=hosts, args=args)
 
-    if args.json:
-        # JSON encoder doesn't like IPv4Address objects -> convert to str
-        results = {str(host): resp for host, resp in results.items()}
-        print(json.dumps(results, indent=2 if HAVE_TTY else None))
-    elif any(val is not None for val in results.values()):
-        data = []
-        headers = ['IP address', 'HW address', 'Recv', 'Time (ms)']
-        for host, neigh in results.items():
-            if neigh is not None:
-                data.append([host, neigh.hw, len(neigh), f'{neigh.time*1e3:.4f}'])
-        data.sort(key=lambda x: x[0])
-        print(simple_tabulate(data, headers=headers))
+    out = generate_output(cache, results, json_out=args.json)
+    if out:
+        print(out)
     else:
         eprint("INFO: no responses received.")
 
