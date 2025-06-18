@@ -1,3 +1,11 @@
+arpsweep (0.3.4-1) unstable; urgency=low
+
+    * Exclude local IP addresses from ARP scans.
+    * Skip IPs in ARP cache which are outside of the given net.
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Wed, 18 Jun 2025 22:45:00 +0300
+
+
 arpsweep (0.3.3-1) unstable; urgency=low
 
     * get_arp_cache_fromproc() honours interface if specified.

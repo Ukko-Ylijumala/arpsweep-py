@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.3-1_20250616"
+__version__   = "0.3.4-1_20250618"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -357,7 +357,7 @@ def get_interface(idx: Optional[int] = None,
     if idx:
         link = IPR.get_links(idx)
     elif name:
-        link = IPR.get_links(IPR.link_lookup(ifname=name)[0])       # pylint: disable=no-member
+        return get_iface_by_name(name)
     elif hwaddr:
         link = IPR.get_links(IPR.link_lookup(address=hwaddr)[0])    # pylint: disable=no-member
     else:
@@ -368,20 +368,55 @@ def get_interface(idx: Optional[int] = None,
 
     link  = link[0]  # get the first (and only) link's data
     attrs = {a[0]: a[1] for a in link['attrs']}
-    data  = {
+    return {
         'name': attrs['IFLA_IFNAME'],
         'idx': link['index'],
         'attrs': attrs,
         'hwaddr': attrs.get('IFLA_ADDRESS', 'unknown'),
-        'ipaddr': []
+        'ipaddr': get_ip_addresses(link['index'])
         }
 
-    # get IPv4 addresses of the iface - primary addr normally is at index 0
-    for ip in IPR.get_addr(index=data['idx'], family=AF_INET):
-        addr_attrs = {a[0]: a[1] for a in ip['attrs']}
-        data['ipaddr'].append(IPv4Address(addr_attrs['IFA_ADDRESS']))
 
-    return data
+def get_iface_by_name(name: str) -> Dict:
+    """Get interface information by name using pyroute2."""
+    try:
+        idx = IPR.link_lookup(ifname=name)[0]  # pylint: disable=no-member
+    except IndexError as e:
+        raise ValueError(f"interface '{name}' not found") from e
+    return get_interface(idx=idx)
+
+
+def get_ip_addresses(iface: Optional[str | int] = None) -> List[IPv4Address]:
+    """Get all (or some) local IPv4 addresses (use pyroute2, fallback to parsing ip cmd output)."""
+    local_ips = []
+
+    if IPR is not None:
+        kwargs = {'family': AF_INET}
+        if iface:
+            kwargs['index'] = get_iface_by_name(iface)['idx'] if isinstance(iface, str) else iface
+        for addr in IPR.get_addr(**kwargs):
+            attrs = {a[0]: a[1] for a in addr['attrs']}
+            if 'IFA_ADDRESS' in attrs:
+                local_ips.append(IPv4Address(attrs['IFA_ADDRESS']))
+    else:
+        # fallback: parse ip command output (easier than parsing /proc/net/fib_trie ...)
+        try:
+            import subprocess   # pylint: disable=import-outside-toplevel
+            cmd = ['ip', '--brief', '-4', 'addr', 'show']
+            if iface:
+                cmd.extend(['dev', iface])
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            for line in result.stdout.splitlines():
+                # format: "ethX@ifY    UP    a.b.c.d/xx e.f.g.h/yy"
+                for ip in line.split()[2:]:
+                    ip = ip.partition('/')[0] # remove subnet mask
+                    local_ips.append(IPv4Address(ip))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            if not iface or iface == 'lo':
+                # last resort: at least return loopback address
+                local_ips.append(IPv4Address('127.0.0.1'))
+
+    return local_ips
 
 
 def get_arp_cache_fromproc(debug: bool, iface: Optional[str] = None):
@@ -515,16 +550,20 @@ def main():
         sys.exit(1)
 
     args = parse_cmdline_args()
-    hosts: Iterable[IPv4Address] = set(args.net.hosts()) if args.rand else list(args.net.hosts())
+    net: IPv4Network = args.net
+    hosts = set(net.hosts()) - set(get_ip_addresses(iface=args.iface))  # exclude local IPs
     cache: Dict[IPv4Address, Neighbor] = {}
+    if not args.rand:
+        hosts = sorted(hosts)   # sort hosts in ascending order if not random
     if args.neigh:
         hosts, cache = filter_cached(hosts, verb=args.verbose, dbg=args.debug, iface=args.iface)
+        # remove ARP cache entries outside the given network
+        cache = {ip: neigh for ip, neigh in cache.items() if ip in net}
 
     if args.daemon:
         daemonize(args, hosts=hosts)
 
     if args.verbose and HAVE_TTY:
-        net: IPv4Network = args.net
         eprint(f'INFO: scanning {net} (net: {net.network_address},',
                f'bcast: {net.broadcast_address}, hosts: {len(hosts)} of {net.num_addresses})')
 
