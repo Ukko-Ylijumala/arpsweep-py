@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.4-1_20250618"
+__version__   = "0.3.4-2_20250619"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -106,7 +106,7 @@ def parse_cmdline_args():
     if p.tasks < 1:
         p.tasks = 1
     elif p.tasks > 1:
-        p.tasks = min(p.tasks, p.net.num_addresses)
+        p.tasks = min(p.tasks, max(p.net.num_addresses-2, 1))
 
     if p.debug:
         p.verbose = True
@@ -551,8 +551,13 @@ def main():
 
     args = parse_cmdline_args()
     net: IPv4Network = args.net
-    hosts = set(net.hosts()) - set(get_ip_addresses(iface=args.iface))  # exclude local IPs
+    my_ips = get_ip_addresses(iface=args.iface)
+    hosts = set(net.hosts()) - set(my_ips)  # exclude local IPs
     cache: Dict[IPv4Address, Neighbor] = {}
+
+    if args.debug and HAVE_TTY:
+        eprint(f'DEBUG: discovered local IP addresses: {my_ips}')
+
     if not args.rand:
         hosts = sorted(hosts)   # sort hosts in ascending order if not random
     if args.neigh:
@@ -565,7 +570,8 @@ def main():
 
     if args.verbose and HAVE_TTY:
         eprint(f'INFO: scanning {net} (net: {net.network_address},',
-               f'bcast: {net.broadcast_address}, hosts: {len(hosts)} of {net.num_addresses})')
+               f'bcast: {net.broadcast_address}, hosts: {len(hosts)}',
+               f'of {max(net.num_addresses-2, 1)})')
 
     if args.tasks > 1:
         if args.debug and HAVE_TTY:
