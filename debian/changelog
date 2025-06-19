@@ -1,3 +1,11 @@
+arpsweep (0.3.4-2) unstable; urgency=low
+
+    * Add/improve some debug output.
+    * Add README.md
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Thu, 19 Jun 2025 15:30:00 +0300
+
+
 arpsweep (0.3.4-1) unstable; urgency=low
 
     * Exclude local IP addresses from ARP scans.
