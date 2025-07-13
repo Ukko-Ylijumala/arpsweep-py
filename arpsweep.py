@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.4-2_20250619"
+__version__   = "0.3.5-1_20250712"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -39,6 +39,8 @@ HAVE_TTY = sys.stdout.isatty()
 ETHER_BC = Ether(dst="ff:ff:ff:ff:ff:ff")
 # ARP cache path
 ARP_CACHE = '/proc/net/arp'
+# sys netdev path
+SYSNET = '/sys/class/net'
 
 
 class Neighbor:
@@ -93,6 +95,7 @@ def parse_cmdline_args():
     args.add_argument('--daemon', '-D', action='store_true', help='Detach process (daemonize)')
     args.add_argument('--neigh', '-N', action='store_true',
                       help='Utilize information in ARP/neighbor cache')
+    args.add_argument('--nopyroute', action='store_true', help='Skip pyroute2 even if available')
     args.add_argument('--json', action='store_true', help='JSON output')
     args.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     args.add_argument('--debug', action='store_true', help='Debug mode - extra verbose')
@@ -101,6 +104,29 @@ def parse_cmdline_args():
 
     p.net = IPv4Network(p.net)
     p.src = IPv4Address(p.src) if p.src else None
+
+    if p.nopyroute:
+        global IPR
+        if IPR is not None:
+            IPR = None
+            if p.debug:
+                eprint("DEBUG: disabling pyroute2 due to '--nopyroute' option being set.")
+
+    if p.iface:
+        if_syspath = os.path.join(SYSNET, p.iface)
+        if not os.path.exists(if_syspath):
+            raise ValueError(f"interface '{p.iface}' does not exist")
+
+        if p.src is None:
+            # if iface is set, use its 1st IP addr as src if it has one
+            ips = get_ip_addresses(iface=p.iface)
+            if ips:
+                p.src = ips[0]
+            else:
+                eprint(f"WARN: interface '{p.iface}' has no IP address. Responses may be lost.")
+
+        if p.debug:
+            eprint(f"DEBUG: using interface '{p.iface}' with source IP {p.src}")
 
     # be sensible with the number of parallel tasks
     if p.tasks < 1:
@@ -261,8 +287,8 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
     for sent, resp in ans:
         # warn if sent and received interfaces do not match
         if sent.hwsrc != resp.hwdst:
-            if_sent = get_interface(hwaddr=sent.hwsrc)['name']
-            if_resp = get_interface(hwaddr=resp.hwdst)['name']
+            if_sent = get_iface_by_hwaddr(hwaddr=sent.hwsrc)['name']
+            if_resp = get_iface_by_hwaddr(hwaddr=resp.hwdst)['name']
             eprint(f'WARN: sent packet from {if_sent} ({sent.hwsrc}),',
                    f'got response on {if_resp} ({resp.hwdst})')
 
@@ -278,7 +304,7 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
     if responses:
         r = responses[0]
         if not iface:
-            iface = get_interface(hwaddr=ans[0][1].hwdst)['name']
+            iface = get_iface_by_hwaddr(hwaddr=ans[0][1].hwdst)['name']
         neigh = Neighbor(ip=r['src_ip'], hw=r['src_hw'], iface=iface, verbose=verbose)
         neigh.if_ip = IPv4Address(ans[0][1].pdst)
         neigh.if_hw = ans[0][1].hwdst
@@ -348,10 +374,55 @@ def daemonize(args, hosts: Iterable[IPv4Address]) -> NoReturn:
     sys.exit(0)
 
 
+def _read_oneliner_file(path: str) -> str:
+    """Read a single line from a file, stripping whitespace."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.readline().strip()
+    except (FileNotFoundError, PermissionError) as e:
+        raise RuntimeError(f"could not read file '{path}': {e}") from e
+
+
 @lru_cache
-def get_interface(idx: Optional[int] = None,
-                  name: Optional[str] = None,
-                  hwaddr: Optional[str] = None) -> Dict:
+def _get_if_name_fromaddr(hwaddr: str) -> str:
+    """Get interface name from hardware address (from sysfs)."""
+    for name in os.listdir(SYSNET):
+        addrpath = os.path.join(SYSNET, name, 'address')
+        if os.path.exists(addrpath):
+            try:
+                addr = _read_oneliner_file(addrpath)
+                if addr.lower() == hwaddr.lower():
+                    return name
+            except RuntimeError:
+                continue
+    raise ValueError(f"interface with hwaddr '{hwaddr}' not found")
+
+
+@lru_cache
+def _get_iface_fromsys(name: str) -> Dict:
+    """Get interface information from /sys/class/net."""
+    attrs = {}
+    if_syspath = os.path.join(SYSNET, name)
+    for item in ('ifindex', 'address', 'mtu', 'tx_queue_len'):
+        try:
+            attrs[item] = _read_oneliner_file(os.path.join(if_syspath, item))
+        except RuntimeError as e:
+            raise ValueError(f"could not read interface attribute for '{name}': {e}") from e
+
+    return {
+        'name': name,
+        'idx': int(attrs['ifindex']),
+        'attrs': {'mtu': int(attrs['mtu']), 'qlen': int(attrs['tx_queue_len'])},
+        'hwaddr': attrs['address'],
+        'ipaddr': get_ip_addresses(name),
+        'datasrc': 'sysfs'
+        }
+
+
+@lru_cache
+def _get_iface_fromipr(idx: Optional[int] = None,
+                       name: Optional[str] = None,
+                       hwaddr: Optional[str] = None) -> Dict:
     """Get interface information using pyroute2 from interface name, index or hwaddr."""
     link = None
     if idx:
@@ -373,17 +444,33 @@ def get_interface(idx: Optional[int] = None,
         'idx': link['index'],
         'attrs': attrs,
         'hwaddr': attrs.get('IFLA_ADDRESS', 'unknown'),
-        'ipaddr': get_ip_addresses(link['index'])
+        'ipaddr': get_ip_addresses(link['index']),
+        'datasrc': 'pyroute2'
         }
 
 
 def get_iface_by_name(name: str) -> Dict:
-    """Get interface information by name using pyroute2."""
+    """Get interface information by name using pyroute2 or from sysfs."""
+    if IPR is None:
+        return _get_iface_fromsys(name)
+
     try:
         idx = IPR.link_lookup(ifname=name)[0]  # pylint: disable=no-member
+        return _get_iface_fromipr(idx=idx)
     except IndexError as e:
         raise ValueError(f"interface '{name}' not found") from e
-    return get_interface(idx=idx)
+
+
+def get_iface_by_hwaddr(hwaddr: str) -> Dict:
+    """Get interface information by hardware address."""
+    if IPR is None:
+        return _get_iface_fromsys(_get_if_name_fromaddr(hwaddr))
+
+    try:
+        idx = IPR.link_lookup(address=hwaddr)[0]  # pylint: disable=no-member
+        return _get_iface_fromipr(idx=idx)
+    except IndexError as e:
+        raise ValueError(f"interface with hwaddr '{hwaddr}' not found") from e
 
 
 def get_ip_addresses(iface: Optional[str | int] = None) -> List[IPv4Address]:
@@ -464,7 +551,7 @@ def get_arp_cache(verbose: bool, debug: bool, iface: Optional[str]):
 
     if iface:
         try:
-            if_data = get_interface(name=iface)
+            if_data = get_iface_by_name(name=iface)
             if debug:
                 eprint(f"DEBUG: using interface {if_data['name']} (idx: {if_data['idx']})")
         except (ValueError, IndexError, KeyError) as e:
@@ -485,7 +572,7 @@ def get_arp_cache(verbose: bool, debug: bool, iface: Optional[str]):
 
             # neighbour interface
             if if_data is None or if_data['idx'] != n['ifindex']:
-                if_data = get_interface(idx=n['ifindex'])
+                if_data = _get_iface_fromipr(idx=n['ifindex'])
             if_name = iface or if_data['name']
 
             # create a Neighbor object and populate it
