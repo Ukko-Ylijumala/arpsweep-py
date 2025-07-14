@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.5-1_20250712"
+__version__   = "0.3.5-2_20250714"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -316,7 +316,7 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
 
 def create_arp_packets(host: IPv4Address, num: int, src: IPv4Address | None):
     """Create ARP request packet(s) for a given host."""
-    return [ETHER_BC / ARP(pdst=str(host), hwsrc=str(src) if src else None) for _ in range(num)]
+    return [ETHER_BC / ARP(pdst=str(host), psrc=str(src) if src else None) for _ in range(num)]
 
 
 def do_arp_sweep(hosts: Iterable[IPv4Address], args):
