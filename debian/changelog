@@ -1,3 +1,10 @@
+arpsweep (0.3.5-4) unstable; urgency=low
+
+    * Fix: explicitly set source MAC to match a specified interface.
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Tue, 15 Jul 2025 21:20:00 +0300
+
+
 arpsweep (0.3.5-3) unstable; urgency=low
 
     * Packet sending interval is configurable.
