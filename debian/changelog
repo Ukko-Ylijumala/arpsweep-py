@@ -1,3 +1,11 @@
+arpsweep (0.3.5-3) unstable; urgency=low
+
+    * Packet sending interval is configurable.
+    * daemon/batch mode sending interval is configurable.
+
+ -- Mikko Tanner <mikko.tanner@gmail.com>  Tue, 15 Jul 2025 14:15:00 +0300
+
+
 arpsweep (0.3.5-2) unstable; urgency=low
 
     * Fix a stupid bug in ARP packet generation with a defined srcip.
