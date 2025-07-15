@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.5-4_20250715"
+__version__   = "0.3.5-5_20250715"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -90,7 +90,7 @@ def parse_cmdline_args():
     args.add_argument('--src', '-S', help='Source IP to use (def: autoselect)')
     args.add_argument('--count', type=int, default=1, help='Number of ARP reqs (def: 1)')
     args.add_argument('--timeout', type=float, default=0.15, help='Request timeout (def: 0.15)')
-    args.add_argument('--inter', type=float, default=0.0, help='Request interval (def: 0.0)')
+    args.add_argument('--inter', type=float, default=0.1, help='Request interval (def: 0.1)')
     args.add_argument('--tasks', '-T', type=int, default=16, help='Scan parallelism (def: 16)')
     args.add_argument('--rand', action='store_true', help='Sweep hosts in random order')
     args.add_argument('--daemon', '-D', action='store_true', help='Detach process (daemonize)')
@@ -286,7 +286,7 @@ def send_packets(pkts: Any, timeout: int, inter: float, iface: str = None, verbo
         Neighbor object with responses, or None if no responses received.
     """
     responses: List[Dict[str, Any]] = []
-    ans, unans = srp(pkts, timeout=timeout, inter=inter, iface=iface, verbose=False)
+    ans, unans = srp(pkts, timeout=timeout, inter=inter, iface=iface, promisc=False)
     for sent, resp in ans:
         # warn if sent and received interfaces do not match
         if sent.hwsrc != resp.hwdst:
@@ -372,7 +372,8 @@ def batch_send(args, packets: List[Ether]):
     """Send ARP packets in batches without waiting for responses. Default is 10 pps."""
     for i in range(0, len(packets), args.tasks):
         chunk = packets[i:i+args.tasks]
-        sendp(chunk, inter=args.inter, iface=args.iface, count=args.count, verbose=False)
+        sendp(chunk, inter=args.inter, iface=args.iface, count=args.count,
+              verbose=False, promisc=False)
         sleep(args.timeout)  # wait a bit before sending the next batch
 
 
