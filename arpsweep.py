@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.5-2_20250714"
+__version__   = "0.3.5-3_20250715"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -89,7 +89,8 @@ def parse_cmdline_args():
     args.add_argument('--iface', '-I', help='Interface to use (def: autoselect)')
     args.add_argument('--src', '-S', help='Source IP to use (def: autoselect)')
     args.add_argument('--count', type=int, default=1, help='Number of ARP reqs (def: 1)')
-    args.add_argument('--timeout', type=float, default=0.1, help='Req timeout in secs (def: 0.1)')
+    args.add_argument('--timeout', type=float, default=0.15, help='Request timeout (def: 0.15)')
+    args.add_argument('--inter', type=float, default=0.0, help='Request interval (def: 0.0)')
     args.add_argument('--tasks', '-T', type=int, default=16, help='Scan parallelism (def: 16)')
     args.add_argument('--rand', action='store_true', help='Sweep hosts in random order')
     args.add_argument('--daemon', '-D', action='store_true', help='Detach process (daemonize)')
@@ -148,6 +149,7 @@ class AsyncARPScanner:
         self.exec = ThreadPoolExecutor(thread_name_prefix='arp-sweep')
         self.limiter = asyncio.Semaphore(args.tasks)
         self.timeout = float(args.timeout)
+        self.inter = float(args.inter)
         self.iface: Optional[str] = args.iface
         self.src: Optional[IPv4Address] = args.src
         self.hosts = hosts
@@ -169,7 +171,7 @@ class AsyncARPScanner:
         try:
             loop = asyncio.get_running_loop()
             pkts = create_arp_packets(host, num=self.count, src=self.src)
-            args = (pkts, self.timeout, self.iface, self.verbose)
+            args = (pkts, self.timeout, self.inter, self.iface, self.verbose)
             async with self.limiter:
                 # return the host too, so we can easily track who this task is for
                 return await loop.run_in_executor(self.exec, send_packets, *args), host
@@ -269,7 +271,7 @@ def simple_tabulate(data: Iterable[Iterable], headers: List = None, missing = '-
     return '\n'.join(formatted_rows)
 
 
-def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
+def send_packets(pkts: Any, timeout: int, inter: float, iface: str = None, verbose = False):
     """
     Send packet(s) and return the received response(s).
 
@@ -283,7 +285,7 @@ def send_packets(pkts: Any, timeout: int, iface: str = None, verbose = False):
         Neighbor object with responses, or None if no responses received.
     """
     responses: List[Dict[str, Any]] = []
-    ans, unans = srp(pkts, timeout=timeout, iface=iface, verbose=False)
+    ans, unans = srp(pkts, timeout=timeout, inter=inter, iface=iface, verbose=False)
     for sent, resp in ans:
         # warn if sent and received interfaces do not match
         if sent.hwsrc != resp.hwdst:
@@ -325,7 +327,7 @@ def do_arp_sweep(hosts: Iterable[IPv4Address], args):
 
     for host in hosts:
         pkts = create_arp_packets(host, num=args.count, src=args.src)
-        resp = send_packets(pkts, timeout=args.timeout, iface=args.iface, verbose=args.verbose)
+        resp = send_packets(pkts, args.timeout, args.inter, iface=args.iface, verbose=args.verbose)
         if resp:
             responses[host] = resp
         else:
@@ -359,10 +361,10 @@ def fork_off():
 
 
 def batch_send(args, packets: List[Ether]):
-    """Send ARP packets in batches without waiting for responses."""
+    """Send ARP packets in batches without waiting for responses. Default is 10 pps."""
     for i in range(0, len(packets), args.tasks):
         chunk = packets[i:i+args.tasks]
-        sendp(chunk, iface=args.iface, count=args.count, verbose=False, inter=0.05) # 20 pps
+        sendp(chunk, inter=args.inter, iface=args.iface, count=args.count, verbose=False)
         sleep(args.timeout)  # wait a bit before sending the next batch
 
 
