@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.5-3_20250715"
+__version__   = "0.3.5-4_20250715"
 __license__   = "GPL-3.0-or-later"
 
 import asyncio
@@ -126,8 +126,9 @@ def parse_cmdline_args():
             else:
                 eprint(f"WARN: interface '{p.iface}' has no IP address. Responses may be lost.")
 
-        if p.debug:
-            eprint(f"DEBUG: using interface '{p.iface}' with source IP {p.src}")
+        if p.verbose or p.debug:
+            hw = get_iface_by_name(p.iface)['hwaddr']
+            eprint(f"INFO: using interface '{p.iface}' with source IP {p.src} (hwaddr: {hw})")
 
     # be sensible with the number of parallel tasks
     if p.tasks < 1:
@@ -170,7 +171,7 @@ class AsyncARPScanner:
         """Send ARP request asynchronously using thread pool."""
         try:
             loop = asyncio.get_running_loop()
-            pkts = create_arp_packets(host, num=self.count, src=self.src)
+            pkts = create_arp_packets(host, num=self.count, src=self.src, iface=self.iface)
             args = (pkts, self.timeout, self.inter, self.iface, self.verbose)
             async with self.limiter:
                 # return the host too, so we can easily track who this task is for
@@ -316,9 +317,16 @@ def send_packets(pkts: Any, timeout: int, inter: float, iface: str = None, verbo
     return None
 
 
-def create_arp_packets(host: IPv4Address, num: int, src: IPv4Address | None):
+def create_arp_packets(host: IPv4Address, num: int,
+                       src: Optional[IPv4Address], iface: Optional[str]):
     """Create ARP request packet(s) for a given host."""
-    return [ETHER_BC / ARP(pdst=str(host), psrc=str(src) if src else None) for _ in range(num)]
+    pkt_base = ETHER_BC / ARP(pdst=str(host), psrc=str(src) if src else None)
+    if iface:
+        # explicitly set source MAC to match the specified interface
+        hwaddr = get_iface_by_name(iface)['hwaddr']
+        pkt_base[Ether].src = hwaddr
+        pkt_base[ARP].hwsrc = hwaddr
+    return [pkt_base for _ in range(num)]
 
 
 def do_arp_sweep(hosts: Iterable[IPv4Address], args):
@@ -326,7 +334,7 @@ def do_arp_sweep(hosts: Iterable[IPv4Address], args):
     responses: Dict[IPv4Address, Optional[Neighbor]] = {}
 
     for host in hosts:
-        pkts = create_arp_packets(host, num=args.count, src=args.src)
+        pkts = create_arp_packets(host, num=args.count, src=args.src, iface=args.iface)
         resp = send_packets(pkts, args.timeout, args.inter, iface=args.iface, verbose=args.verbose)
         if resp:
             responses[host] = resp
@@ -370,7 +378,8 @@ def batch_send(args, packets: List[Ether]):
 
 def daemonize(args, hosts: Iterable[IPv4Address]) -> NoReturn:
     """Daemonize the process to run in the background."""
-    pkts = [pkt for h in hosts for pkt in create_arp_packets(h, num=1, src=args.src)]
+    pkts = [pkt for h in hosts
+            for pkt in create_arp_packets(h, num=args.count, src=args.src, iface=args.iface)]
     fork_off()
     batch_send(args, packets=pkts)
     sys.exit(0)
