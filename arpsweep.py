@@ -286,7 +286,7 @@ def send_packets(pkts: Any, timeout: int, inter: float, iface: str = None, verbo
         Neighbor object with responses, or None if no responses received.
     """
     responses: List[Dict[str, Any]] = []
-    ans, unans = srp(pkts, timeout=timeout, inter=inter, iface=iface, promisc=False)
+    ans, unans = srp(pkts, timeout=timeout, inter=inter, iface=iface, verbose=False, promisc=False)
     for sent, resp in ans:
         # warn if sent and received interfaces do not match
         if sent.hwsrc != resp.hwdst:
